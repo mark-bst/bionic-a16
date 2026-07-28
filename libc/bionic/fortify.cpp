@@ -80,16 +80,34 @@
 
 int __FD_ISSET_chk(int fd, const fd_set* set, size_t set_size) {
   __check_fd_set("FD_ISSET", fd, set_size);
+  if (fd >= FD_SETSIZE) {
+    char process_name[256] = {0};
+    __get_process_name(process_name, sizeof(process_name) - 1);
+    if (!strcmp(process_name, "com.mobile.legends:UnityKillsMe"))
+        return 1;
+  }
   return __FD_ISSET(fd, set);
 }
 
 void __FD_CLR_chk(int fd, fd_set* set, size_t set_size) {
   __check_fd_set("FD_CLR", fd, set_size);
+  if (fd >= FD_SETSIZE) {
+    char process_name[256] = {0};
+    __get_process_name(process_name, sizeof(process_name) - 1);
+    if (!strcmp(process_name, "com.mobile.legends:UnityKillsMe"))
+        return;
+  }
   __FD_CLR(fd, set);
 }
 
 void __FD_SET_chk(int fd, fd_set* set, size_t set_size) {
   __check_fd_set("FD_SET", fd, set_size);
+  if (fd >= FD_SETSIZE) {
+    char process_name[256] = {0};
+    __get_process_name(process_name, sizeof(process_name) - 1);
+    if (!strcmp(process_name, "com.mobile.legends:UnityKillsMe"))
+        return;
+  }
   __FD_SET(fd, set);
 }
 

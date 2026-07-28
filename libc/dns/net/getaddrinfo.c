@@ -666,11 +666,14 @@ android_getaddrinfofornetcontext(const char *hostname, const char *servname,
 		ai0 = *pai;	/* backup *pai */
 
 		if (pai->ai_family == PF_UNSPEC) {
+			pai->ai_family = PF_INET;
+/**
 #ifdef PF_INET6
 			pai->ai_family = PF_INET6;
 #else
 			pai->ai_family = PF_INET;
 #endif
+*/
 		}
 		error = get_portmatch(pai, servname);
 		if (error)
@@ -1926,7 +1929,7 @@ _dns_getaddrinfo(void *rv, void	*cb_data, va_list ap)
 
 	switch (pai->ai_family) {
 	case AF_UNSPEC:
-		/* prefer IPv6 */
+		/* prefer IPv4 */
 		q.name = name;
 		q.qclass = C_IN;
 		q.answer = buf->buf;
@@ -1936,7 +1939,9 @@ _dns_getaddrinfo(void *rv, void	*cb_data, va_list ap)
 			query_ipv6 = _have_ipv6(netcontext->app_mark, netcontext->uid);
 			query_ipv4 = _have_ipv4(netcontext->app_mark, netcontext->uid);
 		}
-		if (query_ipv6) {
+		if (query_ipv4) {
+			q.qtype = T_A;
+		} else if (query_ipv6) {
 			q.qtype = T_AAAA;
 			if (query_ipv4) {
 				q.next = &q2;
@@ -1946,8 +1951,6 @@ _dns_getaddrinfo(void *rv, void	*cb_data, va_list ap)
 				q2.answer = buf2->buf;
 				q2.anslen = sizeof(buf2->buf);
 			}
-		} else if (query_ipv4) {
-			q.qtype = T_A;
 		} else {
 			free(buf);
 			free(buf2);

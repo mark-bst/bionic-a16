@@ -27,6 +27,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -271,6 +272,7 @@ static const char* __prop_error_to_string(int error) {
   return "<unknown>";
 }
 
+int bst_hack_system_property_set(const char *key, const char *value);
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_set(const char* key, const char* value) {
   if (key == nullptr) return -1;
@@ -284,6 +286,8 @@ int __system_property_set(const char* key, const char* value) {
     // Old protocol does not support long names or values
     if (strlen(key) >= PROP_NAME_MAX) return -1;
     if (strlen(value) >= PROP_VALUE_MAX) return -1;
+    if (!bst_hack_system_property_set(key, value))
+        return 0;
 
     prop_msg msg;
     memset(&msg, 0, sizeof msg);
@@ -295,6 +299,8 @@ int __system_property_set(const char* key, const char* value) {
   } else {
     // New protocol only allows long values for ro. properties only.
     if (strlen(value) >= PROP_VALUE_MAX && strncmp(key, "ro.", 3) != 0) return -1;
+    if (!bst_hack_system_property_set(key, value))
+        return 0;
     // Use proper protocol
     PropertyServiceConnection connection(key);
     if (!connection.IsValid()) {
@@ -331,4 +337,463 @@ int __system_property_set(const char* key, const char* value) {
 
     return 0;
   }
+}
+int get_packagname_from_pid(pid_t pid,char *app_name) {
+#define MAX_NAME_LENGTH      64
+    int debug = 0;
+    int result = 0;
+    char comm_name[sizeof("/proc/cmdline") + 8];
+
+    snprintf(comm_name, sizeof(comm_name), "/proc/%d/cmdline", pid);
+    int fd = TEMP_FAILURE_RETRY(open(comm_name, O_RDONLY));
+    if (fd == -1) {
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "error trying to open %s\n", comm_name);
+        return result;
+    }
+
+    int bytes_read = TEMP_FAILURE_RETRY(read(fd, app_name, MAX_NAME_LENGTH));
+
+    if (bytes_read == -1) {
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "error trying to read %s\n", comm_name);
+        close(fd);
+        return result;
+    }
+
+    if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "name is  %s\n", app_name);
+    close(fd);
+    result = 1;
+    return result;
+}
+
+// BS4-9670 Puzzle & Dragon error 70 fix: Helper function to reverse the bluestacks packageName prefix.
+// We are inverting packageName as the error70 sdk is detecting bluestacks based on the prefix present
+// in strings section in the libc.so object.
+void reverse(char* str) {
+    int i;
+    int n;
+    char temp;
+    n = strlen(str);
+    for( i = 0; i < n/2; i++) {
+        temp = str[i];
+        str[i]=str[n-i-1];
+        str[n-i-1]=temp;
+    }
+}
+
+// Helper function to determine if we should modify system properties being read by an app.
+// We try and read pid specific /proc/cmdline entry and determine the behaviour based on app name.
+// Not modifying properties if determined package is of bluestacks, google or android.
+/*
+ * return 0 if bluestacks/google/android package
+ * return 1 otherwise
+ */
+int bst_check_if_third_party_app(pid_t pid, uid_t uid) {
+#define MAX_NAME_LENGTH      64
+    int debug = 0;
+    int result = 0;
+    int package_name_found = 0;
+
+    char app_name[MAX_NAME_LENGTH];
+
+    package_name_found = get_packagname_from_pid(pid,app_name);
+    if (!package_name_found)
+        return result;
+
+    char bst_pkg_prefix[] = "skcatseulb.moc";
+    reverse(bst_pkg_prefix);
+
+    if (uid >= 10000 && !(!strncmp(app_name, bst_pkg_prefix, strlen(bst_pkg_prefix)) ||
+                !strncmp(app_name, "com.google.android", strlen("com.google.android")) ||
+                !strncmp(app_name, "com.location.provider", strlen("com.location.provider")) ||
+                !strncmp(app_name, "com.uncube", strlen("com.uncube")) ||
+                !strncmp(app_name, "com.pop.store", strlen("com.pop.store")) ||
+                !strncmp(app_name, "com.android", strlen("com.android"))))
+        result = 1;
+
+    if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "app name is %s return value is %d\n", app_name, result);
+    return result;
+}
+
+// This function will return 0 for apps passed in excecption list and if it fails to verify package name,
+// or for other apps it will return 1
+int hide_property_from_other_apps(pid_t pid, const char *excecptionList[], int size ) {
+#define MAX_NAME_LENGTH      64
+    int debug = 0;
+    int result = 1;
+    char app_name[MAX_NAME_LENGTH];
+
+    result = get_packagname_from_pid(pid,app_name);
+    if (!result)
+        return result;
+
+    for (int i = 0; i < size; i++) {
+        if (!strncmp(app_name, excecptionList[i], strlen(excecptionList[i]))) {
+            result = 0;
+            break;
+        }
+    }
+
+    if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "app name is %s return value is %d\n", app_name, result);
+    return result;
+}
+
+// return 0 and empty @dst if fails,
+// or it will return pkgname length, fill @dst with pkgname
+static inline unsigned bst_get_current_pkgname(char dst[], unsigned dstlen) {
+    if (dstlen == 0) return 0;
+    const int fd  = TEMP_FAILURE_RETRY(open("/proc/self/cmdline", O_RDONLY));
+    if (fd < 0) return 0;
+    int len = TEMP_FAILURE_RETRY(read(fd, dst, dstlen - 1));
+    close(fd);
+    if (len < 0) len = 0;
+    dst[len] = 0;
+    return len;
+}
+
+/*
+ * Helper function to read value for @pkgname in @file_path with "pkgname;value" format in lines.
+ * If succ: return "value length" and fill parsed @value.
+ * If fail: return 0 if it fails to find pkgname or the value is of 0 length,
+ */
+static const unsigned max_pkgname_len = 64;
+static inline int bst_read_custom_value_for_app(const char* pkgname, const char* file_path, char value[PROP_VALUE_MAX]) {
+    const bool debug = false;
+    char line[max_pkgname_len+PROP_VALUE_MAX+4];
+    FILE* fp = fopen(file_path, "r");
+    if (fp == nullptr) {
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "read_custom_value_for_app error opening file [%s] for pkg = %s\n", file_path, pkgname);
+        return 0;
+    }
+
+    const int name_len = strlen(pkgname);
+    // iterate through the file to get the pkgname entries.
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, pkgname, name_len) != 0) continue;
+
+        char* subtoken = strchr(line, ';');
+        if (subtoken == nullptr) continue;
+
+        ++subtoken;
+        int len = strlen(subtoken);
+        if (len > 0 && subtoken[len-1] == '\n') {
+            subtoken[--len] = '\0';
+        }
+        if (len >= PROP_VALUE_MAX) {
+            len = PROP_VALUE_MAX - 1;
+            subtoken[len] = '\0';
+        }
+        memcpy(value, subtoken, len + 1);
+
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "Found matching entry of %s, value: %s\n", pkgname, value);
+        fclose(fp);
+        return len;
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+// If succ: Return value length and fill @value corresponding to pkgname when success.
+// If fail: Return 0 if it fails to find current pkgname in @file_path, or value for current pkgname is empty
+static inline int bst_obtain_custom_value_from_path(const char* file_path, char value[PROP_VALUE_MAX]) {
+    char pkgname[max_pkgname_len];
+    if (bst_get_current_pkgname(pkgname, max_pkgname_len) <= 0) return 0;
+
+    return bst_read_custom_value_for_app(pkgname, file_path, value);
+}
+
+int match_uid_helper(const char *path, uid_t val, int buff_length) {
+#define MAX_UID_LENGTH     10
+
+  int debug = 0;
+  char buff[buff_length];
+  unsigned long present_uid = -1;
+
+  FILE* fp = fopen(path, "r");
+  if (fp == NULL) {
+    if (debug) async_safe_format_log(ANDROID_LOG_WARN, "libc", "match_uid_helper error opening file [%s] for myuid = %u\n", path, val);
+    return 0;
+  }
+
+  // now we open the marker file and iterate through the file to get the uid entries, and match it with our required value.
+  while (fgets(buff, buff_length, fp)) {
+    char *p;
+    present_uid = strtoul(buff, &p, MAX_UID_LENGTH);
+    if (val == present_uid) {
+      if (debug) async_safe_format_log(ANDROID_LOG_WARN, "libc", "Found matching entry of %lu\n", present_uid);
+      // we have a match, return here itself.
+      fclose(fp);
+      return 1;
+    }
+  }
+
+  // we reached here means we have parsed the file and did not get a match, returning 0.
+  fclose(fp);
+  return 0;
+}
+
+/*
+ * BS4-11141: ROK tries to set property sys.usb.config to none after which adb disconnects
+ * so not allowing 3rd party apps to set this property to none.
+ * return 0 - if we don't want the app to set the property
+ * return -1 - otherwise.
+ *
+ */
+int bst_hack_system_property_set(const char *key, const char *value) {
+    int debug = 0;
+    uid_t myuid = getuid();
+    pid_t mypid = getpid();
+    if (myuid >= 10000
+            && ((!strncmp(key, "sys.usb.config", strlen("sys.usb.config")) && !strncmp(value, "none", strlen("none")))
+                || (!strncmp(key, "persist.sys.usb.config", strlen("persist.sys.usb.config")) && !strncmp(value, "none", strlen("none"))))
+            && bst_check_if_third_party_app(mypid, myuid)) {
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "uid: %u trying to set %s to %s\n", myuid, key, value);
+        return 0;
+    }
+    return -1;
+}
+
+/* Helper function to return modified ro.secure/ro.debuggable system property values if calling app is not of bluestacks/android/google.
+ * Bug 7294: Puzzle and Dragons crash on launch as it tries to read ro.debuggable values.
+ * Also, if arm apps try to run getprop or read system property for CPU ABI values.
+ * For such apps, we will return the ARM ABIs irrespective of actual values.
+ * Apps like com.xlcw.hxct.mgdd.m4399,com.lxd.SehzAresunique.m4399 read these values
+ */
+int bst_hack_system_property(const char *name, char *value) {
+#define APP_WITH_ABI2                      "/data/downloads/.tmp/.bstABI2Apps"
+#define APP_WITH_ABI2_SHOWDEFAULTCPUABI    "/data/downloads/.tmp/.bstxABIApps"
+#define CPU_ABI                            "armeabi-v7a"
+#define CPU_ABI_LIST_32                    "armeabi-v7a,armeabi"
+#if defined(__LP64__)
+#define CPU_ABI_LIST_64                    "arm64-v8a"
+#endif
+#define MAX_BUFF_LENGTH                    64
+#define VALUE_1                            "1"
+#define VALUE_0                            "0"
+#define VALUE_TRUE                         "true"
+#define STOP                               "stopped"
+#define CRYPTO_ENCRYPTED                   "encrypted"
+#define CRYPTO_BLKDEV                      "/dev/block/dm-1"
+#define CRYPTO_TYPE                        "block"
+#define USB_STATE_NONE                     "none"
+#define TREBLE_ENABLED                     "true"
+#define VERITYMODE_ENFORCING               "enforcing"
+#define WIFI_INTERFACE_WLAN0               "wlan0"
+#define WIFI_DIRECT_INTERFACE              "p2p-dev-wlan0"
+#define CONTROL_PRIVAPP_PERMISSION_ENFORCE "enforce"
+    int debug = 0;
+    int len = 0;
+    int is_uid_match = 0, is_show_abi_uid = 0;
+    uid_t myuid = getuid();
+    pid_t mypid = getpid();
+
+    // If some third party app is trying to read system properties ro.secure/ro.debuggable, then show them the modified values.
+    // Apps like puzzle and dragon tries to read ro.debuggable and crashes if does not get user build specific values.
+    if (myuid >= 10000
+            && name != NULL && value != NULL
+            && (!strcmp(name, "ro.secure") || !strcmp(name, "ro.debuggable")
+                || !strcmp(name, "ro.allow.mock.location") || !strcmp(name, "ro.crypto.state")
+                || !strcmp(name, "ro.adb.secure") || !strncmp(name, "init.svc.bst", strlen("init.svc.bst"))
+                || !strcmp(name, "init.svc.imeservice") || !strcmp(name, "init.svc.appstatsd")
+                || !strcmp(name, "init.svc.enable_arm_bin") || !strcmp(name, "gsm.sim.bstserial")
+                || !strcmp(name, "init.svc.postupgrade") || !strcmp(name, "init.svc.adbd")
+                || !strcmp(name, "persist.sys.devId") || !strcmp(name, "persist.sys.pcode")
+                || !strcmp(name, "persist.sys.user.email") || !strcmp(name, "persist.sys.abivalue")
+                || !strcmp(name, "sys.usb.config") || !strcmp(name, "persist.sys.usb.config")
+                || !strcmp(name, "ro.treble.enabled") || !strcmp(name, "init.svc.bindmount")
+                || !strcmp(name, "init.svc.mountsf") || !strcmp(name, "ro.crypto.fs_crypto_blkdev")
+                || !strcmp(name, "ro.crypto.type") || !strcmp(name, "ro.boot.veritymode")
+                || !strcmp(name, "persist.netd.stable_secret") || !strcmp(name, "wifi.interface")
+                || !strcmp(name, "ro.dalvik.vm.native.bridge") || !strcmp(name, "ro.control_privapp_permissions")
+                || !strcmp(name, "ro.apex.updatable") || !strcmp(name, "ro.crypto.metadata.enabled")
+                || !strcmp(name, "wifi.direct.interface"))
+            && bst_check_if_third_party_app(mypid, myuid)) {
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "uid: %u trying to read %s hence returning modifying results\n", myuid, name);
+        if (!strcmp(name, "ro.secure")) {
+            // changing value as some third party app is reading ro.secure
+            len = strlen(VALUE_1);
+            memcpy(value, VALUE_1, len+1);
+        } else if (!strcmp(name, "ro.debuggable")) {
+            // changing value as some third party app is reading ro.debuggable
+            len = strlen(VALUE_0);
+            memcpy(value, VALUE_0, len+1);
+        }
+        else if (!strcmp(name, "ro.allow.mock.location")) {
+            // changing value as some third party app is reading ro.mock.location
+            len = strlen(VALUE_0);
+            memcpy(value, VALUE_0, len+1);
+        }
+        else if (!strcmp(name, "ro.crypto.state")) {
+            // changing value as some third party app is reading ro.crypto.state
+            len = strlen(CRYPTO_ENCRYPTED);
+            memcpy(value, CRYPTO_ENCRYPTED, len+1);
+        }
+        else if (!strcmp(name, "ro.crypto.fs_crypto_blkdev")) {
+            // changing value as some third party app is reading ro.crypto.fs_crypto_blkdev
+            len = strlen(CRYPTO_BLKDEV);
+            memcpy(value, CRYPTO_BLKDEV, len+1);
+        }
+        else if (!strcmp(name, "ro.crypto.type")) {
+            // changing value as some third party app is reading ro.crypto.type
+            len = strlen(CRYPTO_TYPE);
+            memcpy(value, CRYPTO_TYPE, len+1);
+        }
+        else if (!strcmp(name, "ro.adb.secure")) {
+            // changing value as some third party app is reading ro.adb.secure
+            len = strlen(VALUE_1);
+            memcpy(value, VALUE_1, len+1);
+        }
+        else if (!strcmp(name, "ro.treble.enabled")) {
+            // changing value as some third party app is reading ro.treble.enabled
+            len = strlen(TREBLE_ENABLED);
+            memcpy(value, TREBLE_ENABLED, len+1);
+        }
+        else if (!strcmp(name, "init.svc.adbd")) {
+            // changing value as some third party app is reading init.svc.adbd
+            len = strlen(STOP);
+            memcpy(value, STOP, len + 1);
+        }
+        else if (!strcmp(name, "ro.boot.veritymode")) {
+            // changing value as some third party app is reading ro.boot.veritymode
+            len = strlen(VERITYMODE_ENFORCING);
+            memcpy(value, VERITYMODE_ENFORCING, len + 1);
+        }
+        else if (!strcmp(name, "wifi.interface")) {
+            // changing value as some third party app is reading wifi.interface
+            len = strlen(WIFI_INTERFACE_WLAN0);
+            memcpy(value, WIFI_INTERFACE_WLAN0, len + 1);
+        }
+        else if (!strcmp(name, "ro.control_privapp_permissions")) {
+            // changing value as some third party app is reading ro.control_privapp_permissions
+            len = strlen(CONTROL_PRIVAPP_PERMISSION_ENFORCE);
+            memcpy(value, CONTROL_PRIVAPP_PERMISSION_ENFORCE, len + 1);
+        }
+        else if (!strcmp(name, "ro.apex.updatable")) {
+            len = strlen(VALUE_TRUE);
+            memcpy(value, VALUE_TRUE, len + 1);
+        }
+        else if (!strcmp(name, "ro.crypto.metadata.enabled")) {
+            len = strlen(VALUE_TRUE);
+            memcpy(value, VALUE_TRUE, len + 1);
+        }
+        else if (!strcmp(name, "wifi.direct.interface")) {
+            len = strlen(WIFI_DIRECT_INTERFACE);
+            memcpy(value, WIFI_DIRECT_INTERFACE, len + 1);
+        }
+        else if (!strncmp(name, "init.svc.bst", strlen("init.svc.bst"))
+                || !strcmp(name, "init.svc.imeservice") || !strcmp(name, "init.svc.appstatsd")
+                || !strcmp(name, "init.svc.enable_arm_bin") || !strcmp(name, "gsm.sim.bstserial")
+                || !strcmp(name, "init.svc.postupgrade") || !strcmp(name, "persist.sys.devId")
+                || !strcmp(name, "persist.sys.pcode") || !strcmp(name, "persist.sys.user.email")
+                || !strcmp(name, "persist.sys.abivalue") || !strcmp(name, "init.svc.bindmount")
+                || !strcmp(name, "init.svc.mountsf") || !strcmp(name, "persist.netd.stable_secret")
+                || !strcmp(name, "ro.dalvik.vm.native.bridge")) {
+            // Sending null value for bluestacks specific property
+            // Apps like th.co.dcp.townkins try to read properties init.svc.bstfolderd and init.svc.bstsvcmgrtest
+            // So sending null for such properties if asked by some third party app.
+            len = -1;
+            value[0] = 0;
+        }
+        else if (!strcmp(name, "sys.usb.config") || !strcmp(name, "persist.sys.usb.config")) {
+            len = strlen(USB_STATE_NONE);
+            memcpy(value, USB_STATE_NONE, len+1);
+        }
+    } else if(myuid >= 10000 && name != NULL && value != NULL && (strstr(name,"cpu.abi") || strstr(name, "native.bridge") || strstr(name, "ro.arch"))) {
+        is_uid_match = match_uid_helper(APP_WITH_ABI2, myuid, MAX_BUFF_LENGTH);
+
+        // Some china apps like com.netease.TCYM.uc; com.youzu.wzqj.ad.baidu; com.zmxyol.union.baidu installed in arm mode
+        // crash when we return arm specific cpu.abi values.
+        // Hence returning default abi values to such apps based on a marker file under /data/downloads if their Uid entry is present in the same.
+        is_show_abi_uid = match_uid_helper(APP_WITH_ABI2_SHOWDEFAULTCPUABI, myuid, MAX_BUFF_LENGTH);
+
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR,"libc" ,"app uid %u rying to read: %s  is_uid_match:%d  is_show_abi_uid: %d\n", myuid, name, is_uid_match, is_show_abi_uid);
+
+        if (is_uid_match == 1) {
+            //Case 14627: Modifying ro.dalvik.vm.native.bridge to arm value '0' for arm apps.
+            //This fixes the illegal env detection in security sdk G-presto integrated in this app.
+        if (!strcmp(name, "ro.dalvik.vm.native.bridge")) {
+        len = strlen(VALUE_0);
+        memcpy(value, VALUE_0, len+1);
+        } else if (!strcmp(name, "ro.arch")) {
+        len = -1;
+        value[0] = 0;
+        } else if (is_show_abi_uid == 0) {
+                if (!strcmp(name, "ro.product.cpu.abi")) {
+                    // changing value as arm app is reading ro.product.cpu.abi
+                    len = strlen(CPU_ABI);
+                    memcpy(value, CPU_ABI, len+1);
+                } else if (!strcmp(name, "ro.product.cpu.abilist") || !strcmp(name, "ro.product.cpu.abilist32")) {
+                    // changing value as arm app is reading ro.product.cpu.abilist
+                    len = strlen(CPU_ABI_LIST_32);
+                    memcpy(value, CPU_ABI_LIST_32, len+1);
+                }
+#if defined(__LP64__)
+                else if (!strcmp(name, "ro.product.cpu.abilist64")) {
+                    // changing value as arm app is reading ro.product.cpu.abilist64
+                    len = strlen(CPU_ABI_LIST_64);
+                    memcpy(value, CPU_ABI_LIST_64, len+1);
+                }
+#endif
+                else if (debug) {
+                    async_safe_format_log(ANDROID_LOG_ERROR,"libc" ,"trying to read unknown property: %s : %u\n", name, myuid);
+                }
+            }
+        }
+    } else if (myuid >= 10000 && name != NULL && value != NULL && !strcmp(name,"ro.csc.sales_code")) {
+        // Sending null value for this specific property,as only samsung apps should be able to read this value
+#define PKG_1 "com.sec.android.app.samsungapps"
+#define PKG_2 "com.sec.android.app.billing"
+#define PKG_3 "com.osp.app.signin"
+#define PKG_4 "com.samsung.android.mobileservice"
+
+        const char *excecptionList[] = {PKG_1, PKG_2, PKG_3, PKG_4};
+        if (hide_property_from_other_apps(mypid, excecptionList, sizeof(excecptionList)/ sizeof(excecptionList[0]))) {
+            len = -1;
+            value[0] = 0;
+        }
+    } else if (myuid >= 10000 && name != NULL && value != NULL && !strcmp(name,"ro.product.store")) {
+        // Sending null value for this specific property,as only one store apps should be able to read this value
+#define PKG_5       "com.skt.skaf.OA00018282"
+#define PKG_6       "com.skt.skaf.A000Z00040"
+
+        const char *excecptionList[] = {PKG_5, PKG_6};
+        if (hide_property_from_other_apps(mypid, excecptionList, sizeof(excecptionList)/ sizeof(excecptionList[0]))) {
+            len = -1;
+            value[0] = 0;
+        }
+    } else if (name != NULL && value != NULL
+            && (! strcmp(name, "ro.product.board")
+                || !strcmp(name, "ro.product.brand")
+                || !strcmp(name, "ro.product.device")
+                || !strcmp(name, "ro.product.manufacturer")
+                || !strcmp(name, "ro.product.model")
+                || !strcmp(name, "ro.product.name")
+                || !strcmp(name, "ro.build.fingerprint")
+                || !strcmp(name, "ro.build.platform")
+                || !strcmp(name, "ro.build.product")
+                || !strcmp(name, "ro.build.description")
+                || !strcmp(name, "ro.hardware"))) {
+
+        // Return custom model value for some games that use error 70 detection.
+        // These games will only run on some x86 devices with certain models on Pie.
+        if (myuid >= 10000 && !strcmp(name, "ro.product.model")) {
+            len = bst_obtain_custom_value_from_path("/data/downloads/.tmp/.modelProp", value);
+            if (len > 0) {
+                return len;
+            }
+        }
+        // Return the value of corresponding bst.<prop_name> properties when above properties are read.
+        // If returned value is 0 then return the values of original properties i.e. prop_name.
+        char prop_name[PROP_NAME_MAX];
+        sprintf(prop_name, "bst.%s",name);
+
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "uid: %u trying to read %s hence returning results for property %s\n", myuid, name, prop_name);
+        int len = __system_property_get(prop_name, value);
+
+        if (debug) async_safe_format_log(ANDROID_LOG_ERROR, "libc", "value is = %s\n", value );
+        if (len != 0) {
+            return len;
+        }
+    }
+    return len;
 }

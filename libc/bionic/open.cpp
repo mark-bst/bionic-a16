@@ -56,6 +56,10 @@ __strong_alias(creat64, creat);
 int open(const char* pathname, int flags, ...) {
   mode_t mode = 0;
 
+  // Returning ENOENT if pathname is NULL
+  if (!pathname)
+      return -1;
+
   if (needs_mode(flags)) {
     va_list args;
     va_start(args, flags);
@@ -74,6 +78,10 @@ int __open_2(const char* pathname, int flags) {
 
 int openat(int fd, const char *pathname, int flags, ...) {
   mode_t mode = 0;
+
+  // Returning ENOENT if pathname is NULL
+  if (!pathname)
+      return -1;
 
   if (needs_mode(flags)) {
     va_list args;

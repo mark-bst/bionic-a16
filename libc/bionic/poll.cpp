@@ -27,6 +27,8 @@
  */
 
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
 #include <sys/poll.h>
 #include <sys/select.h>
 
@@ -79,6 +81,16 @@ int ppoll64(pollfd* fds, nfds_t fd_count, const timespec* ts, const sigset64_t* 
   return __ppoll(fds, fd_count, mutable_ts_ptr, mutable_ss_ptr, sizeof(*mutable_ss_ptr));
 }
 
+static void __get_process_name(char *process_name, size_t size) {
+    if (!process_name) return;
+
+    FILE *fp = fopen("/proc/self/cmdline", "r");
+    if (!fp) return;
+
+    fread(process_name, 1, size, fp);
+    fclose(fp);
+}
+
 int select(int fd_count, fd_set* read_fds, fd_set* write_fds, fd_set* error_fds, timeval* tv) {
   timespec ts;
   timespec* ts_ptr = nullptr;
@@ -89,6 +101,15 @@ int select(int fd_count, fd_set* read_fds, fd_set* write_fds, fd_set* error_fds,
     }
     ts_ptr = &ts;
   }
+
+  if (fd_count > FD_SETSIZE && fd_count <= FD_SETSIZE * 8) {
+    char process_name[256] = {0};
+    __get_process_name(process_name, sizeof(process_name) - 1);
+    if (!strcmp(process_name, "com.mobile.legends:UnityKillsMe") ||
+        !strcmp(process_name, "com.riotgames.league.wildrift"))
+        return 1;
+  }
+
   int result = __pselect6(fd_count, read_fds, write_fds, error_fds, ts_ptr, nullptr);
   if (tv != nullptr) {
     timeval_from_timespec(*tv, ts);

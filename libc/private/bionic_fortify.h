@@ -32,11 +32,23 @@
 
 #include <poll.h> // For struct pollfd.
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/select.h> // For struct fd_set.
 
 #include <async_safe/log.h>
 #include <private/bionic_inline_raise.h>
+
+static inline void __get_process_name(char *process_name, size_t size) {
+    if (!process_name || size <= 0) return;
+
+    FILE *fp = fopen("/proc/self/cmdline", "r");
+    if (!fp) return;
+
+    fread(process_name, 1, size, fp);
+    fclose(fp);
+}
 
 //
 // LLVM can't inline variadic functions, and we don't want one definition of
@@ -64,7 +76,13 @@ static inline void __check_fd_set(const char* fn, int fd, size_t set_size) {
     __fortify_fatal("%s: file descriptor %d < 0", fn, fd);
   }
   if (__predict_false(fd >= FD_SETSIZE)) {
-    __fortify_fatal("%s: file descriptor %d >= FD_SETSIZE %d", fn, fd, FD_SETSIZE);
+      char process_name[256] = {0};
+      __get_process_name(process_name, sizeof(process_name) - 1);
+      if (__predict_false(fd >= FD_SETSIZE * 8) ||
+        (strcmp(process_name, "com.mobile.legends:UnityKillsMe") &&
+         strcmp(process_name, "com.riotgames.league.wildrift"))) {
+        __fortify_fatal("%s: file descriptor %d >= FD_SETSIZE %d", fn, fd, FD_SETSIZE);
+      }
   }
   if (__predict_false(set_size < sizeof(fd_set))) {
     __fortify_fatal("%s: set size %zu is too small to be an fd_set", fn, set_size);
