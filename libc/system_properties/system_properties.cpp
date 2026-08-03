@@ -48,10 +48,14 @@
 #include "system_properties/context_node.h"
 #include "system_properties/prop_area.h"
 #include "system_properties/prop_info.h"
+#include "obs_str.hpp"
 
 #define SERIAL_DIRTY(serial) ((serial)&1)
 #define SERIAL_VALUE_LEN(serial) ((serial) >> 24)
 #define APPCOMPAT_PREFIX "ro.appcompat_override."
+
+extern int bst_hack_system_property(const char* name, char* value);
+extern int bst_hack_system_property_set(const char* key, const char* value);
 
 static bool is_dir(const char* pathname) {
   struct stat info;
@@ -213,7 +217,21 @@ uint32_t SystemProperties::ReadMutablePropertyValue(const prop_info* pi, char* v
 }
 
 int SystemProperties::Read(const prop_info* pi, char* name, char* value) {
-  uint32_t serial = ReadMutablePropertyValue(pi, value);
+  // Some properties have not been added to the property area yet, but still
+  // need a BlueStacks compatibility value.
+  if (pi == nullptr) {
+    int bst_length = bst_hack_system_property(name, value);
+    return bst_length > 0 ? bst_length : 0;
+  }
+
+  int length;
+  int bst_length = bst_hack_system_property(pi->name, value);
+  if (bst_length > 0) {
+    length = bst_length;
+  } else {
+    uint32_t serial = ReadMutablePropertyValue(pi, value);
+    length = SERIAL_VALUE_LEN(serial);
+  }
   if (name != nullptr) {
     size_t namelen = strlcpy(name, pi->name, PROP_NAME_MAX);
     if (namelen >= PROP_NAME_MAX) {
@@ -232,7 +250,7 @@ int SystemProperties::Read(const prop_info* pi, char* name, char* value) {
         " __system_property_read_callback() instead.",
         pi->name, strlen(pi->long_value()));
   }
-  return SERIAL_VALUE_LEN(serial);
+  return length;
 }
 
 void SystemProperties::ReadCallback(const prop_info* pi,
@@ -241,6 +259,14 @@ void SystemProperties::ReadCallback(const prop_info* pi,
                                     void* cookie) {
   // Read only properties don't need to copy the value to a temporary buffer, since it can never
   // change.  We use relaxed memory order on the serial load for the same reason.
+  char bst_value[PROP_VALUE_MAX];
+  int bst_length = bst_hack_system_property(pi->name, bst_value);
+  if (bst_length > 0) {
+    uint32_t serial = load_const_atomic(&pi->serial, memory_order_relaxed);
+    callback(cookie, pi->name, bst_value, serial);
+    return;
+  }
+
   if (is_read_only(pi->name)) {
     uint32_t serial = load_const_atomic(&pi->serial, memory_order_relaxed);
     if (pi->is_long()) {
@@ -256,12 +282,26 @@ void SystemProperties::ReadCallback(const prop_info* pi,
   callback(cookie, pi->name, value_buf, serial);
 }
 
+static int CopyPropertyValue(char* destination, const char* source) {
+  const char* begin = destination;
+  while ((*destination = *source) != '\0') {
+    ++source;
+    ++destination;
+  }
+  return destination - begin;
+}
+
 int SystemProperties::Get(const char* name, char* value) {
   const prop_info* pi = Find(name);
 
   if (pi != nullptr) {
     return Read(pi, nullptr, value);
   } else {
+    if (name != nullptr && name[0] == 'r' && name[1] == 'o' && name[2] == '.' &&
+        getuid() >= 10000 &&
+        obs_str::gnu_hash(name) == obs_str::gnu_hash("ro.board.platform2")) {
+      return CopyPropertyValue(value, OBS_TMP_STR("ngg-client"));
+    }
     value[0] = 0;
     return 0;
   }
@@ -282,6 +322,10 @@ int SystemProperties::Update(prop_info* pi, const char* value, unsigned int len)
       have_override ? appcompat_override_contexts_->GetSerialPropArea() : nullptr;
   if (!serial_pa) {
     return -1;
+  }
+
+  if (!bst_hack_system_property_set(pi->name, pi->value)) {
+    return 0;
   }
   prop_area* pa = contexts_->GetPropAreaForName(pi->name);
   prop_area* override_pa =
@@ -358,6 +402,10 @@ int SystemProperties::Add(const char* name, unsigned int namelen, const char* va
     async_safe_format_log(ANDROID_LOG_ERROR, "libc",
                           "__system_property_add failed: properties not initialized");
     return -1;
+  }
+
+  if (!bst_hack_system_property_set(name, value)) {
+    return 0;
   }
 
   prop_area* serial_pa = contexts_->GetSerialPropArea();
