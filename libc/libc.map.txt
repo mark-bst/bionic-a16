@@ -522,6 +522,8 @@ LIBC {
     inotify_rm_watch;
     insque;
     ioctl;
+    ioperm; # x86 x86_64
+    iopl; # x86 x86_64
     isalnum;
     isalnum_l;
     isalpha;

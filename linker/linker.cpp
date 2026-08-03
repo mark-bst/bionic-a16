@@ -3386,10 +3386,12 @@ bool soinfo::link_image(const SymbolLookupList& lookup_list, soinfo* local_group
 
 #if !defined(__LP64__)
   if (has_text_relocations) {
+#if !defined(__i386__)
     if (DL_ERROR_AFTER(23, "\"%s\" has text relocations", get_realpath())) {
       return false;
     }
     add_dlwarning(get_realpath(), "text relocations");
+#endif
     // Make segments writable to allow text relocations to work properly. We will later call
     // phdr_table_protect_segments() after all of them are applied.
     if (phdr_table_unprotect_segments(phdr, phnum, load_bias, should_pad_segments_,

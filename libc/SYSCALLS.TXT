@@ -368,6 +368,8 @@ __riscv_flush_icache:riscv_flush_icache(void*, void*, unsigned long) riscv64
 
 # x86-specific
 __set_thread_area:set_thread_area(void*) x86
+ioperm(unsigned long, unsigned long, int) x86,x86_64
+iopl(int) x86,x86_64
 arch_prctl(int, unsigned long) x86_64
 
 # vdso stuff.
