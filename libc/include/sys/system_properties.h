@@ -118,7 +118,8 @@ bool __system_property_wait(const prop_info* _Nullable __pi, uint32_t __old_seri
 /** Deprecated. Use __system_property_foreach() instead. */
 const prop_info* _Nullable __system_property_find_nth(unsigned __n);
 /** Deprecated. Use __system_property_read_callback() instead. */
-int __system_property_read(const prop_info* _Nonnull __pi, char* _Nullable __name, char* _Nonnull __value);
+int __system_property_read(const prop_info* _Nullable __pi, char* _Nullable __name,
+                           char* _Nonnull __value);
 /** Deprecated. Use __system_property_read_callback() instead. */
 int __system_property_get(const char* _Nonnull __name, char* _Nonnull __value);
 /** Deprecated: use __system_property_wait() instead. */
