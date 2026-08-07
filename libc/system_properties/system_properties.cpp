@@ -261,7 +261,7 @@ void SystemProperties::ReadCallback(const prop_info* pi,
   // change.  We use relaxed memory order on the serial load for the same reason.
   char bst_value[PROP_VALUE_MAX];
   int bst_length = bst_hack_system_property(pi->name, bst_value);
-  if (bst_length != 0) {
+  if (bst_length > 0) {
     uint32_t serial = load_const_atomic(&pi->serial, memory_order_relaxed);
     callback(cookie, pi->name, bst_value, serial);
     return;
