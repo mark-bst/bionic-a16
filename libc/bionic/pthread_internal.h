@@ -150,7 +150,6 @@ class pthread_internal_t {
   // determine the top and bottom of the stack quickly, which would otherwise require special logic
   // for the main thread.
   uintptr_t stack_top;
-  uintptr_t stack_bottom;
 
   // Whether the thread is in the process of terminating (has blocked signals), or has already
   // terminated. This is used by android_run_on_all_threads() to avoid sending a signal to a thread
@@ -186,6 +185,8 @@ class pthread_internal_t {
   bool should_allocate_stack_mte_ringbuffer;
 
   bool is_main() { return start_routine == nullptr; }
+
+  uintptr_t stack_bottom;  // BS-A16: moved from after stack_top to struct end, so bionic_tls stays at 0x2f8 (berberis/guest ABI). See commit a380954.
 };
 
 struct ThreadMapping {
